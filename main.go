@@ -27,6 +27,7 @@ var (
 	fibonacciFlag      int
 	printFibonacciFlag bool
 	pauseFlag          bool
+	printYAMLFlag      bool
 )
 
 func main() {
@@ -70,6 +71,12 @@ func main() {
 		false,
 		"Set to true to pause the program after the API server is started.")
 
+	flag.BoolVar(
+		&printYAMLFlag,
+		"print-yaml",
+		false,
+		"Set to true to print the YAML of one of the generated objects.")
+
 	flag.Parse()
 
 	if fibonacciFlag < 2 {
@@ -102,6 +109,7 @@ func main() {
 		Fibonacci:      fibonacciFlag,
 		FibonacciPrint: printFibonacciFlag,
 		Pause:          pauseFlag,
+		YAMLPrint:      printYAMLFlag,
 	}
 
 	ctx, cancel := context.WithTimeout(
@@ -169,6 +177,8 @@ func main() {
 		if !os.IsNotExist(err) {
 			abort("failed to stat kubeconfig file: %v\n", err)
 		}
+		env.UseExistingCluster = &[]bool{false}[0]
+		externalControlPlane = false
 	} else {
 		env.UseExistingCluster = &[]bool{true}[0]
 		externalControlPlane = true

@@ -2,7 +2,6 @@ package benchmark
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
@@ -13,13 +12,14 @@ import (
 
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	openapispec "k8s.io/kube-openapi/pkg/validation/spec"
 )
 
-// fuzzConfigMap returns a ConfigMap with deterministic but varied data to simulate fuzz-loaded resources.
+// fuzzConfigMap returns a ConfigMap with deterministic but varied data to
+// simulate fuzz-loaded resources.
 func fuzzConfigMap(namespace string, seed int) *corev1.ConfigMap {
 	r := rand.New(rand.NewSource(int64(seed)))
 	data := make(map[string]string)
@@ -86,30 +86,44 @@ func fuzzPod(namespace string, seed int) *corev1.Pod {
 	}
 }
 
-// crdSchemaForGVK returns the OpenAPIV3Schema for the given GVK from the CRD
-// list, or nil.
-func crdSchemaForGVK(
-	crds []*apiextensionsv1.CustomResourceDefinition,
-	gvk schema.GroupVersionKind) *apiextensionsv1.JSONSchemaProps {
+func openAPISchemaType(s *openapispec.Schema) string {
+	if s == nil || len(s.Type) == 0 {
+		return ""
+	}
+	return s.Type[0]
+}
 
-	for _, crd := range crds {
-		if crd.Spec.Group != gvk.Group {
-			continue
-		}
-		if crd.Spec.Names.Kind != gvk.Kind {
-			continue
-		}
-		for _, v := range crd.Spec.Versions {
-			if v.Name != gvk.Version {
-				continue
-			}
-			if v.Schema != nil && v.Schema.OpenAPIV3Schema != nil {
-				return v.Schema.OpenAPIV3Schema
-			}
-			return nil
+func openAPIExtBool(s *openapispec.Schema, key string) bool {
+	if s == nil || s.Extensions == nil {
+		return false
+	}
+	b, _ := s.Extensions[key].(bool)
+	return b
+}
+
+func openAPIExtString(s *openapispec.Schema, key string) string {
+	if s == nil || s.Extensions == nil {
+		return ""
+	}
+	str, _ := s.Extensions[key].(string)
+	return str
+}
+
+func openAPIExtStrings(s *openapispec.Schema, key string) []string {
+	if s == nil || s.Extensions == nil {
+		return nil
+	}
+	raw, ok := s.Extensions[key].([]interface{})
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, v := range raw {
+		if str, ok := v.(string); ok {
+			out = append(out, str)
 		}
 	}
-	return nil
+	return out
 }
 
 const maxFuzzDepth = 8 // limit recursion for nested objects/lists
@@ -268,23 +282,20 @@ func defaultForRequiredField(name string, seed int, r *rand.Rand) interface{} {
 	}
 }
 
-// enumFromAllOfOneOfAnyOf returns a merged enum from allOf (intersection), or first non-empty from oneOf/anyOf.
-func enumFromAllOfOneOfAnyOf(schema *apiextensionsv1.JSONSchemaProps) []apiextensionsv1.JSON {
-	if schema == nil {
+// enumFromAllOfOneOfAnyOfOpenAPI returns a merged enum from allOf (intersection), or first non-empty from oneOf/anyOf.
+func enumFromAllOfOneOfAnyOfOpenAPI(s *openapispec.Schema) []interface{} {
+	if s == nil {
 		return nil
 	}
-	if len(schema.AllOf) > 0 {
+	if len(s.AllOf) > 0 {
 		var merged []string
-		for i, sub := range schema.AllOf {
+		for i, sub := range s.AllOf {
 			if len(sub.Enum) == 0 {
 				continue
 			}
 			var vals []string
 			for _, e := range sub.Enum {
-				var v interface{}
-				if err := json.Unmarshal(e.Raw, &v); err == nil {
-					vals = append(vals, fmt.Sprintf("%v", v))
-				}
+				vals = append(vals, fmt.Sprintf("%v", e))
 			}
 			if i == 0 {
 				merged = vals
@@ -303,40 +314,35 @@ func enumFromAllOfOneOfAnyOf(schema *apiextensionsv1.JSONSchemaProps) []apiexten
 			}
 		}
 		if len(merged) > 0 {
-			out := make([]apiextensionsv1.JSON, len(merged))
-			for i, s := range merged {
-				raw, _ := json.Marshal(s)
-				out[i] = apiextensionsv1.JSON{Raw: raw}
+			out := make([]interface{}, len(merged))
+			for i, v := range merged {
+				out[i] = v
 			}
 			return out
 		}
 	}
-	for _, sub := range schema.OneOf {
-		if len(sub.Enum) > 0 {
-			return sub.Enum
+	for i := range s.OneOf {
+		if len(s.OneOf[i].Enum) > 0 {
+			return s.OneOf[i].Enum
 		}
 	}
-	for _, sub := range schema.AnyOf {
-		if len(sub.Enum) > 0 {
-			return sub.Enum
+	for i := range s.AnyOf {
+		if len(s.AnyOf[i].Enum) > 0 {
+			return s.AnyOf[i].Enum
 		}
 	}
 	return nil
 }
 
-// valueFromDefaultOrExample returns a value from schema.Default or schema.Example if set.
-func valueFromDefaultOrExample(schema *apiextensionsv1.JSONSchemaProps) interface{} {
-	if schema.Default != nil && len(schema.Default.Raw) > 0 {
-		var v interface{}
-		if err := json.Unmarshal(schema.Default.Raw, &v); err == nil {
-			return v
-		}
+func valueFromDefaultOrExampleOpenAPI(s *openapispec.Schema) interface{} {
+	if s == nil {
+		return nil
 	}
-	if schema.Example != nil && len(schema.Example.Raw) > 0 {
-		var v interface{}
-		if err := json.Unmarshal(schema.Example.Raw, &v); err == nil {
-			return v
-		}
+	if s.Default != nil {
+		return s.Default
+	}
+	if s.Example != nil {
+		return s.Example
 	}
 	return nil
 }
@@ -381,15 +387,17 @@ func stringFromFormat(format string, seed int, r *rand.Rand) string {
 	}
 }
 
-// stringMatchingPattern returns a string that satisfies length constraints and, if possible, the pattern.
-// Default: DNS-compliant, ≤32 chars, unless schema or field-specific rules say otherwise.
-func stringMatchingPattern(schema *apiextensionsv1.JSONSchemaProps, fieldName string, seed int, r *rand.Rand) string {
-	minL, maxL := int64(0), int64(32) // default: DNS-compliant ≤32 unless schema/field constrains
-	if schema.MinLength != nil && *schema.MinLength > 0 {
-		minL = *schema.MinLength
+// stringMatchingPatternOpenAPI returns a string that satisfies length constraints and, if possible, the pattern.
+func stringMatchingPatternOpenAPI(s *openapispec.Schema, fieldName string, seed int, r *rand.Rand) string {
+	if s == nil {
+		return dnsLabel(32, seed, r)
 	}
-	if schema.MaxLength != nil && *schema.MaxLength > 0 {
-		maxL = *schema.MaxLength
+	minL, maxL := int64(0), int64(32)
+	if s.MinLength != nil && *s.MinLength > 0 {
+		minL = *s.MinLength
+	}
+	if s.MaxLength != nil && *s.MaxLength > 0 {
+		maxL = *s.MaxLength
 	}
 	fieldLower := strings.ToLower(fieldName)
 	switch fieldLower {
@@ -410,45 +418,39 @@ func stringMatchingPattern(schema *apiextensionsv1.JSONSchemaProps, fieldName st
 	case "uniqueid":
 		return uniqueIDVM(seed, r)
 	}
-	// Any field name containing "uuid" is treated as UUID v4 (e.g. biosUUID, instanceUUID).
 	if strings.Contains(fieldLower, "uuid") {
 		return uuidV4(seed, r)
 	}
 	if maxL < minL {
 		maxL = minL
 	}
-	// If Format is set, use it (and trim to maxLength)
-	if schema.Format != "" {
-		s := stringFromFormat(schema.Format, seed, r)
-		if s != "" {
-			if int64(len(s)) > maxL {
-				s = s[:maxL]
+	if s.Format != "" {
+		str := stringFromFormat(s.Format, seed, r)
+		if str != "" {
+			if int64(len(str)) > maxL {
+				str = str[:maxL]
 			}
-			if int64(len(s)) < minL {
-				s = s + strings.Repeat("x", int(minL)-len(s))
+			if int64(len(str)) < minL {
+				str = str + strings.Repeat("x", int(minL)-len(str))
 			}
-			return s
+			return str
 		}
 	}
-	// Kubernetes quantity-like pattern
-	if schema.Pattern != "" && (strings.Contains(schema.Pattern, "KMGTPE") || strings.Contains(schema.Pattern, "quantity") || strings.Contains(schema.Pattern, "numkMGTPE")) {
+	if s.Pattern != "" && (strings.Contains(s.Pattern, "KMGTPE") || strings.Contains(s.Pattern, "quantity") || strings.Contains(s.Pattern, "numkMGTPE")) {
 		return "1Gi"
 	}
-	// MAC address pattern: ^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$
-	if schema.Pattern != "" && strings.Contains(schema.Pattern, "0-9A-Fa-f") && strings.Contains(schema.Pattern, "){5}") {
-		s := stringFromFormat("mac", seed, r)
-		if int64(len(s)) > maxL {
-			s = s[:maxL]
+	if s.Pattern != "" && strings.Contains(s.Pattern, "0-9A-Fa-f") && strings.Contains(s.Pattern, "){5}") {
+		str := stringFromFormat("mac", seed, r)
+		if int64(len(str)) > maxL {
+			str = str[:maxL]
 		}
-		return s
+		return str
 	}
-	// Condition reason: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
-	if schema.Pattern != "" && strings.Contains(schema.Pattern, "[A-Za-z0-9_])?$") {
+	if s.Pattern != "" && strings.Contains(s.Pattern, "[A-Za-z0-9_])?$") {
 		reasons := []string{"Ready", "Pending", "Error", "FuzzReason", "Created", "Updated"}
 		return reasons[r.Intn(len(reasons))]
 	}
-	// Word chars only: \w+ (alphanumeric and underscore)
-	if schema.Pattern != "" && (strings.Contains(schema.Pattern, `\w`) || strings.Contains(schema.Pattern, "w+")) {
+	if s.Pattern != "" && (strings.Contains(s.Pattern, `\w`) || strings.Contains(s.Pattern, "w+")) {
 		const word = "abcdefghijklmnopqrstuvwxyz0123456789_"
 		n := minL
 		if n < 2 {
@@ -463,109 +465,108 @@ func stringMatchingPattern(schema *apiextensionsv1.JSONSchemaProps, fieldName st
 		}
 		return string(b)
 	}
-	// Generic string: DNS-compliant label, constrained by schema or field rules above
 	return dnsLabel(int(maxL), seed, r)
 }
 
-// fuzzFromSchema generates a fuzz value from a JSONSchemaProps using type, Format, Pattern,
-// Enum, Default, Example, Min/Max length, Min/Max/MultipleOf, and x-kubernetes-* extensions.
-// fieldName is the property name when recursing from an object (for name/message/error caps); use "" otherwise.
-func fuzzFromSchema(schema *apiextensionsv1.JSONSchemaProps, seed int, depth int, fieldName string) interface{} {
+// fuzzFromOpenAPISchema generates a fuzz value from an OpenAPI spec.Schema,
+// resolving $ref from components when present.
+func fuzzFromOpenAPISchema(s *openapispec.Schema, components map[string]*openapispec.Schema, visited map[string]bool, seed int, depth int, fieldName string) interface{} {
 	if depth > maxFuzzDepth {
 		return nil
 	}
 	r := rand.New(rand.NewSource(int64(seed)))
-	if schema == nil {
+	if s == nil {
 		return nil
 	}
-	// Default or Example take precedence when present
-	if v := valueFromDefaultOrExample(schema); v != nil {
-		return v
-	}
-	// Enum: explicit set of valid values (including from allOf/oneOf/anyOf)
-	enum := schema.Enum
-	if len(enum) == 0 {
-		enum = enumFromAllOfOneOfAnyOf(schema)
-	}
-	if len(enum) > 0 {
-		raw := enum[r.Intn(len(enum))].Raw
-		var v interface{}
-		if err := json.Unmarshal(raw, &v); err == nil {
-			// Don't use enum value "string" or "integer" for fields that must be integer (e.g. unitNumber)
-			if s, ok := v.(string); ok && (s == "string" || s == "integer") {
-				fieldLower := strings.ToLower(fieldName)
-				if strings.Contains(fieldLower, "unitnumber") {
-					return float64(r.Intn(16))
-				}
-			}
-			return v
+	// Resolve $ref so we fuzz the actual schema
+	if s.Ref.String() != "" {
+		resolved := ResolveRef(s, components, visited)
+		if resolved != nil {
+			s = resolved
 		}
 	}
-	// x-kubernetes-int-or-string: value may be int or string
-	if schema.XIntOrString {
+	if v := valueFromDefaultOrExampleOpenAPI(s); v != nil {
+		return v
+	}
+	enum := s.Enum
+	if len(enum) == 0 {
+		enum = enumFromAllOfOneOfAnyOfOpenAPI(s)
+	}
+	if len(enum) > 0 {
+		v := enum[r.Intn(len(enum))]
+		if str, ok := v.(string); ok && (str == "string" || str == "integer") {
+			fieldLower := strings.ToLower(fieldName)
+			if strings.Contains(fieldLower, "unitnumber") {
+				return float64(r.Intn(16))
+			}
+		}
+		return v
+	}
+	if openAPIExtBool(s, "x-kubernetes-int-or-string") {
 		if r.Intn(2) == 0 {
 			return float64(r.Intn(1000))
 		}
 		return dnsLabel(19, seed, r)
 	}
-	switch schema.Type {
+	typ := openAPISchemaType(s)
+	switch typ {
 	case "string":
-		s := stringMatchingPattern(schema, fieldName, seed, r)
-		if s == "" {
+		str := stringMatchingPatternOpenAPI(s, fieldName, seed, r)
+		if str == "" {
 			switch strings.ToLower(fieldName) {
 			case "name":
-				s = dnsLabel(19, seed, r)
+				str = dnsLabel(19, seed, r)
 			case "message", "error":
-				s = shortString(127, seed, r)
+				str = shortString(127, seed, r)
 			case "zone", "keyid", "providerid":
-				s = shortString(63, seed, r)
+				str = shortString(63, seed, r)
 			case "diskuuid":
-				s = uuidV4(seed, r)
+				str = uuidV4(seed, r)
 			case "uniqueid":
-				s = uniqueIDVM(seed, r)
+				str = uniqueIDVM(seed, r)
 			default:
 				if strings.Contains(strings.ToLower(fieldName), "uuid") {
-					s = uuidV4(seed, r)
+					str = uuidV4(seed, r)
 				} else {
-					s = dnsLabel(32, seed, r)
+					str = dnsLabel(32, seed, r)
 				}
 			}
 		}
-		return s
+		return str
 	case "boolean":
 		return r.Intn(2) == 1
 	case "integer", "number":
 		val := float64(r.Intn(10000))
-		if schema.Minimum != nil && val < *schema.Minimum {
-			val = *schema.Minimum
+		if s.Minimum != nil && val < *s.Minimum {
+			val = *s.Minimum
 		}
-		if schema.Maximum != nil && val > *schema.Maximum {
-			val = *schema.Maximum
+		if s.Maximum != nil && val > *s.Maximum {
+			val = *s.Maximum
 		}
-		if schema.ExclusiveMinimum && schema.Minimum != nil {
-			val = math.Max(val, *schema.Minimum+1)
+		if s.ExclusiveMinimum && s.Minimum != nil {
+			val = math.Max(val, *s.Minimum+1)
 		}
-		if schema.ExclusiveMaximum && schema.Maximum != nil {
-			val = math.Min(val, *schema.Maximum-1)
+		if s.ExclusiveMaximum && s.Maximum != nil {
+			val = math.Min(val, *s.Maximum-1)
 		}
-		if schema.MultipleOf != nil && *schema.MultipleOf > 0 {
-			val = math.Floor(val/(*schema.MultipleOf)) * (*schema.MultipleOf)
+		if s.MultipleOf != nil && *s.MultipleOf > 0 {
+			val = math.Floor(val/(*s.MultipleOf)) * (*s.MultipleOf)
 		}
 		return val
 	case "array":
-		itemSchema := (*apiextensionsv1.JSONSchemaProps)(nil)
-		if schema.Items != nil {
-			itemSchema = schema.Items.Schema
-			if itemSchema == nil && len(schema.Items.JSONSchemas) > 0 {
-				itemSchema = &schema.Items.JSONSchemas[0]
+		var itemSchema *openapispec.Schema
+		if s.Items != nil {
+			itemSchema = s.Items.Schema
+			if itemSchema == nil && len(s.Items.Schemas) > 0 {
+				itemSchema = &s.Items.Schemas[0]
 			}
 		}
 		minItems, maxItems := int64(0), int64(3)
-		if schema.MinItems != nil {
-			minItems = *schema.MinItems
+		if s.MinItems != nil {
+			minItems = *s.MinItems
 		}
-		if schema.MaxItems != nil && *schema.MaxItems > 0 {
-			maxItems = *schema.MaxItems
+		if s.MaxItems != nil && *s.MaxItems > 0 {
+			maxItems = *s.MaxItems
 		}
 		if maxItems < minItems {
 			maxItems = minItems
@@ -574,68 +575,74 @@ func fuzzFromSchema(schema *apiextensionsv1.JSONSchemaProps, seed int, depth int
 		if maxItems > minItems {
 			n = minItems + r.Int63n(maxItems-minItems+1)
 		}
-		// When we have an item schema, generate at least one item so the list is not empty
 		if itemSchema != nil && n == 0 {
 			n = 1
 		}
 		arr := make([]interface{}, 0, n)
-		listType := ""
-		if schema.XListType != nil {
-			listType = *schema.XListType
-		}
-		listMapKeys := schema.XListMapKeys
-		seen := make(map[string]bool) // for list-type "set" uniqueness
+		listType := openAPIExtString(s, "x-kubernetes-list-type")
+		listMapKeys := openAPIExtStrings(s, "x-kubernetes-list-map-keys")
+		seen := make(map[string]bool)
 		for i := int64(0); i < n; i++ {
 			if itemSchema == nil {
 				arr = append(arr, dnsLabel(32, seed+int(i), r))
 				continue
 			}
 			if depth+1 > maxFuzzDepth {
-				// At depth limit: still add a placeholder object or array so the list is non-empty
-				if itemSchema.Type == "object" || len(itemSchema.Properties) > 0 {
-					arr = append(arr, map[string]interface{}{})
-				} else if itemSchema.Type == "array" {
+				it := openAPISchemaType(itemSchema)
+				if it == "object" || len(itemSchema.Properties) > 0 {
+					placeholder := map[string]interface{}{}
+					arr = append(arr, placeholder)
+					// Set list-map keys on placeholder so entries remain unique (no duplicate key values).
+					if listType == "map" && len(listMapKeys) > 0 {
+						for _, listKey := range listMapKeys {
+							keyLower := strings.ToLower(listKey)
+							if keyLower == "busnumber" || keyLower == "unitnumber" {
+								placeholder[listKey] = float64(i)
+							} else if propSchema, ok := itemSchema.Properties[listKey]; ok && (openAPISchemaType(&propSchema) == "integer" || openAPISchemaType(&propSchema) == "number") {
+								placeholder[listKey] = float64(i)
+							} else {
+								placeholder[listKey] = fmt.Sprintf("key-%d-%d", seed+int(i), r.Int())
+							}
+						}
+					}
+				} else if it == "array" {
 					arr = append(arr, []interface{}{})
 				} else {
 					arr = append(arr, dnsLabel(32, seed+int(i), r))
 				}
 				continue
 			}
-			item := fuzzFromSchema(itemSchema, seed+int(i)*100, depth+1, "")
+			item := fuzzFromOpenAPISchema(itemSchema, components, copyVisitedOpenAPI(visited), seed+int(i)*100, depth+1, "")
 			if item == nil {
-				if itemSchema.Type == "object" || len(itemSchema.Properties) > 0 {
+				it := openAPISchemaType(itemSchema)
+				if it == "object" || len(itemSchema.Properties) > 0 {
 					item = map[string]interface{}{}
-				} else if itemSchema.Type == "array" {
+				} else if it == "array" {
 					item = []interface{}{}
 				} else {
 					item = dnsLabel(32, seed+int(i), r)
 				}
 			}
-			// list-type "map": each item must have the map keys set (required for identification).
-			// Use schema enum for "type" so we get valid values (e.g. IDE/NVME/SCSI/SATA, Classic/Managed).
+			// x-kubernetes-list-type=map with x-kubernetes-list-map-keys: each key must be
+			// unique per entry (see https://kubernetes.io/docs/reference/using-api/server-side-apply/).
 			if listType == "map" && len(listMapKeys) > 0 {
 				if m, ok := item.(map[string]interface{}); ok {
 					for _, listKey := range listMapKeys {
 						keyLower := strings.ToLower(listKey)
 						switch keyLower {
-						case "busnumber":
+						case "busnumber", "unitnumber":
+							// Numeric list-map keys: use index so each entry is unique.
 							m[listKey] = float64(i)
 						case "name":
 							m[listKey] = dnsLabel(19, seed+int(i), r)
 						case "type":
 							if propSchema, ok := itemSchema.Properties[listKey]; ok {
-								enum := propSchema.Enum
-								if len(enum) == 0 {
-									enum = enumFromAllOfOneOfAnyOf(&propSchema)
+								penum := propSchema.Enum
+								if len(penum) == 0 {
+									penum = enumFromAllOfOneOfAnyOfOpenAPI(&propSchema)
 								}
-								if len(enum) > 0 {
-									raw := enum[r.Intn(len(enum))].Raw
-									var v interface{}
-									if err := json.Unmarshal(raw, &v); err == nil {
-										m[listKey] = v
-									} else {
-										m[listKey] = fmt.Sprintf("key-%d-%d", seed+int(i), r.Int())
-									}
+								if len(penum) > 0 {
+									m[listKey] = penum[r.Intn(len(penum))]
 								} else {
 									m[listKey] = fmt.Sprintf("key-%d-%d", seed+int(i), r.Int())
 								}
@@ -643,12 +650,19 @@ func fuzzFromSchema(schema *apiextensionsv1.JSONSchemaProps, seed int, depth int
 								m[listKey] = fmt.Sprintf("key-%d-%d", seed+int(i), r.Int())
 							}
 						default:
+							// Use schema type for list-map key: integer/number need unique numeric values.
+							if propSchema, ok := itemSchema.Properties[listKey]; ok {
+								pt := openAPISchemaType(&propSchema)
+								if pt == "integer" || pt == "number" {
+									m[listKey] = float64(i)
+									break
+								}
+							}
 							m[listKey] = fmt.Sprintf("key-%d-%d", seed+int(i), r.Int())
 						}
 					}
 				}
 			}
-			// list-type "set": avoid duplicate scalar/object identity
 			if listType == "set" {
 				key := fmt.Sprintf("%v", item)
 				if seen[key] {
@@ -661,31 +675,29 @@ func fuzzFromSchema(schema *apiextensionsv1.JSONSchemaProps, seed int, depth int
 		return arr
 	case "object":
 		out := make(map[string]interface{})
-		// x-kubernetes-embedded-resource: object must have apiVersion, kind, metadata
-		if schema.XEmbeddedResource {
+		if openAPIExtBool(s, "x-kubernetes-embedded-resource") {
 			out["apiVersion"] = "v1"
 			out["kind"] = "Generic"
-			out["metadata"] = map[string]interface{}{
-				"name": dnsLabel(19, seed, r),
-			}
+			out["metadata"] = map[string]interface{}{"name": dnsLabel(19, seed, r)}
 		}
 		requiredSet := make(map[string]bool)
-		for _, req := range schema.Required {
+		for _, req := range s.Required {
 			requiredSet[req] = true
 		}
-		for propName, propSchema := range schema.Properties {
+		for propName, propSchema := range s.Properties {
 			if propName == "metadata" || propName == "apiVersion" || propName == "kind" {
-				if !schema.XEmbeddedResource {
+				if !openAPIExtBool(s, "x-kubernetes-embedded-resource") {
 					continue
 				}
 			}
-			v := fuzzFromSchema(&propSchema, seed+int(r.Int63n(100)), depth+1, propName)
+			prop := propSchema
+			v := fuzzFromOpenAPISchema(&prop, components, copyVisitedOpenAPI(visited), seed+int(r.Int63n(100)), depth+1, propName)
 			if v == nil {
 				if requiredSet[propName] {
 					v = defaultForRequiredField(propName, seed, r)
-				} else if propSchema.Type == "object" || len(propSchema.Properties) > 0 {
+				} else if openAPISchemaType(&propSchema) == "object" || len(propSchema.Properties) > 0 {
 					v = map[string]interface{}{}
-				} else if propSchema.Type == "array" {
+				} else if openAPISchemaType(&propSchema) == "array" {
 					v = []interface{}{}
 				}
 			}
@@ -707,55 +719,67 @@ func fuzzFromSchema(schema *apiextensionsv1.JSONSchemaProps, seed int, depth int
 				out[key] = defaultForRequiredField(key, seed, r)
 			}
 		}
-		// Force valid quantity for any quantity-like field that got a non-quantity string
 		for key := range quantityLikeKeys {
 			if v, ok := out[key]; ok {
-				if s, ok := v.(string); ok && !quantityFull.MatchString(s) {
+				if str, ok := v.(string); ok && !quantityFull.MatchString(str) {
 					out[key] = "1Gi"
 				}
 			}
 		}
 		return out
 	}
-	if len(schema.Properties) > 0 {
-		return fuzzFromSchema(&apiextensionsv1.JSONSchemaProps{Type: "object", Properties: schema.Properties, Required: schema.Required}, seed, depth, "")
+	if len(s.Properties) > 0 {
+		return fuzzFromOpenAPISchema(s, components, visited, seed, depth, "")
 	}
-	// oneOf/anyOf: pick first subschema that is object, array, integer, or number and fuzz it
-	for _, sub := range schema.OneOf {
-		if sub.Type == "object" && len(sub.Properties) > 0 {
-			return fuzzFromSchema(&sub, seed, depth, fieldName)
+	for i := range s.OneOf {
+		sub := &s.OneOf[i]
+		if openAPISchemaType(sub) == "object" && len(sub.Properties) > 0 {
+			return fuzzFromOpenAPISchema(sub, components, copyVisitedOpenAPI(visited), seed, depth, fieldName)
 		}
 		if len(sub.Properties) > 0 {
-			return fuzzFromSchema(&apiextensionsv1.JSONSchemaProps{Type: "object", Properties: sub.Properties, Required: sub.Required}, seed, depth, fieldName)
+			return fuzzFromOpenAPISchema(sub, components, copyVisitedOpenAPI(visited), seed, depth, fieldName)
 		}
-		if sub.Type == "array" && sub.Items != nil {
-			return fuzzFromSchema(&sub, seed, depth, fieldName)
+		if openAPISchemaType(sub) == "array" && sub.Items != nil {
+			return fuzzFromOpenAPISchema(sub, components, copyVisitedOpenAPI(visited), seed, depth, fieldName)
 		}
-		if sub.Type == "integer" || sub.Type == "number" {
-			return fuzzFromSchema(&sub, seed, depth, fieldName)
+		if openAPISchemaType(sub) == "integer" || openAPISchemaType(sub) == "number" {
+			return fuzzFromOpenAPISchema(sub, components, copyVisitedOpenAPI(visited), seed, depth, fieldName)
 		}
 	}
-	for _, sub := range schema.AnyOf {
-		if sub.Type == "object" && len(sub.Properties) > 0 {
-			return fuzzFromSchema(&sub, seed, depth, fieldName)
+	for i := range s.AnyOf {
+		sub := &s.AnyOf[i]
+		if openAPISchemaType(sub) == "object" && len(sub.Properties) > 0 {
+			return fuzzFromOpenAPISchema(sub, components, copyVisitedOpenAPI(visited), seed, depth, fieldName)
 		}
 		if len(sub.Properties) > 0 {
-			return fuzzFromSchema(&apiextensionsv1.JSONSchemaProps{Type: "object", Properties: sub.Properties, Required: sub.Required}, seed, depth, fieldName)
+			return fuzzFromOpenAPISchema(sub, components, copyVisitedOpenAPI(visited), seed, depth, fieldName)
 		}
-		if sub.Type == "array" && sub.Items != nil {
-			return fuzzFromSchema(&sub, seed, depth, fieldName)
+		if openAPISchemaType(sub) == "array" && sub.Items != nil {
+			return fuzzFromOpenAPISchema(sub, components, copyVisitedOpenAPI(visited), seed, depth, fieldName)
 		}
-		if sub.Type == "integer" || sub.Type == "number" {
-			return fuzzFromSchema(&sub, seed, depth, fieldName)
+		if openAPISchemaType(sub) == "integer" || openAPISchemaType(sub) == "number" {
+			return fuzzFromOpenAPISchema(sub, components, copyVisitedOpenAPI(visited), seed, depth, fieldName)
 		}
 	}
 	return nil
 }
 
-// fuzzUnstructured returns an Unstructured for the given GVK, using the scheme
-// and CRD schema when available to guide fuzz.
+func copyVisitedOpenAPI(m map[string]bool) map[string]bool {
+	if m == nil {
+		return nil
+	}
+	c := make(map[string]bool, len(m))
+	for k, v := range m {
+		c[k] = v
+	}
+	return c
+}
+
+// fuzzUnstructured returns an Unstructured for the given GVK, using the
+// OpenAPI root schema and components when available to guide fuzz.
 func fuzzUnstructured(
-	crds []*apiextensionsv1.CustomResourceDefinition,
+	rootSchema *openapispec.Schema,
+	components map[string]*openapispec.Schema,
 	gvk schema.GroupVersionKind,
 	namespace string,
 	seed int) *unstructured.Unstructured {
@@ -767,19 +791,18 @@ func fuzzUnstructured(
 	u.SetName(fmt.Sprintf("%s-%d-%d", strings.ToLower(gvk.Kind), seed, r.Int()))
 	u.SetLabels(map[string]string{"bench": "crci", "seed": fmt.Sprintf("%d", seed)})
 
-	rootSchema := crdSchemaForGVK(crds, gvk)
-	if rootSchema != nil {
-		// Root schema usually has properties: apiVersion, kind, metadata, spec,
-		// status. Generate fuzz for spec (and optionally status).
+	if rootSchema != nil && components != nil {
 		if specSchema, ok := rootSchema.Properties["spec"]; ok {
-			if specVal := fuzzFromSchema(&specSchema, seed, 0, ""); specVal != nil {
+			spec := specSchema
+			if specVal := fuzzFromOpenAPISchema(&spec, components, nil, seed, 0, ""); specVal != nil {
 				if m, ok := specVal.(map[string]interface{}); ok {
 					_ = unstructured.SetNestedField(u.Object, m, "spec")
 				}
 			}
 		}
 		if statusSchema, ok := rootSchema.Properties["status"]; ok {
-			if statusVal := fuzzFromSchema(&statusSchema, seed+1000, 0, ""); statusVal != nil {
+			status := statusSchema
+			if statusVal := fuzzFromOpenAPISchema(&status, components, nil, seed+1000, 0, ""); statusVal != nil {
 				if m, ok := statusVal.(map[string]interface{}); ok {
 					sanitizeFuzzedStatus(m)
 					_ = unstructured.SetNestedField(u.Object, m, "status")
@@ -787,7 +810,6 @@ func fuzzUnstructured(
 			}
 		}
 	}
-	// Ensure spec exists if we didn't set it from schema
 	if _, hasSpec := u.Object["spec"]; !hasSpec {
 		_ = unstructured.SetNestedField(u.Object, map[string]interface{}{}, "spec")
 	}

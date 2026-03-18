@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -36,6 +37,10 @@ type BenchmarkCacheMemoryOptions struct {
 	// Pause is true to pause the program after the API server is started.
 	Pause bool
 
+	// ResourceName is the Kubernetes resource to test: configmap, secret, pod,
+	// or group/version/kind.
+	ResourceName string
+
 	// KubeConfig is the path to a kubeconfig file to use for the benchmark.
 	KubeConfig string
 
@@ -55,6 +60,9 @@ type BenchmarkCacheMemoryOptions struct {
 	// FibonacciPrint is true to print the fibonacci sequence to the console and
 	// exit.
 	FibonacciPrint bool
+
+	// YAMLPrint is true to print the YAML of one of the generated objects.
+	YAMLPrint bool
 }
 
 // BenchmarkCacheMemory runs the controller under envtest, loads N resources
@@ -67,6 +75,20 @@ func BenchmarkCacheMemory(
 
 	fmt.Fprintf(os.Stderr, "* Running benchmarks for:\n")
 	fmt.Fprintf(os.Stderr, "  * kubeconfig: %s\n", opts.KubeConfig)
+	fmt.Fprintf(os.Stderr, "  * hostname:   %s\n", opts.Config.Host)
+
+	fib := fibonacci(opts.Fibonacci)
+	strFib := make([]string, len(fib))
+	for i, n := range fib {
+		strFib[i] = strconv.Itoa(n)
+	}
+	fmt.Fprintf(
+		os.Stderr,
+		"  * fibonacci sequence: %s\n",
+		strings.Join(strFib, ", "))
+	if opts.FibonacciPrint {
+		return nil
+	}
 
 	var (
 		gvkStr string
@@ -82,17 +104,20 @@ func BenchmarkCacheMemory(
 		"  * groupVersionKind: %s\n",
 		gvkStr)
 
-	fib := fibonacci(opts.Fibonacci)
-	strFib := make([]string, len(fib))
-	for i, n := range fib {
-		strFib[i] = strconv.Itoa(n)
+	createObj, err := objectCreatorForWatched(opts)
+	if err != nil {
+		return fmt.Errorf("failed to get object creator: %w", err)
 	}
-	fmt.Fprintf(
-		os.Stderr,
-		"  * fibonacci sequence: %s\n",
-		strings.Join(strFib, ", "))
-	if opts.FibonacciPrint {
-		return nil
+
+	if opts.YAMLPrint {
+		obj := createObj("", 0)
+		data, _ := yaml.Marshal(obj)
+		fmt.Fprintf(os.Stderr, "  * example object:\n")
+		fmt.Fprintf(os.Stderr, "    ---\n")
+		for l := range bytes.Lines(data) {
+			fmt.Fprintf(os.Stderr, "    %s", string(l))
+		}
+		fmt.Fprintf(os.Stderr, "    ---\n")
 	}
 
 	fmt.Fprintln(os.Stderr)
@@ -108,7 +133,7 @@ func BenchmarkCacheMemory(
 	var runs []heapRun
 	for _, n := range fib {
 		fmt.Fprintf(os.Stderr, "* %d objects...", n)
-		r, err := benchmarkCacheMemoryN(ctx, opts, n)
+		r, err := benchmarkCacheMemoryN(ctx, opts, createObj, n)
 		if err != nil {
 			return fmt.Errorf("n=%d: %w", n, err)
 		}
@@ -135,6 +160,7 @@ func BenchmarkCacheMemory(
 func benchmarkCacheMemoryN(
 	ctx context.Context,
 	opts BenchmarkCacheMemoryOptions,
+	createObj objectCreator,
 	n int) (_ benchmarkCacheMemoryResult, retErr error) {
 
 	mgr, err := manager.New(opts.Config, manager.Options{})
@@ -144,12 +170,6 @@ func benchmarkCacheMemoryN(
 	}
 
 	gvk := opts.GroupVersionKind
-
-	createObj, err := objectCreatorForWatched(nil, gvk)
-	if err != nil {
-		return benchmarkCacheMemoryResult{},
-			fmt.Errorf("object creator: %w", err)
-	}
 
 	crciController.SkipNameValidation = ptr(true)
 	if err := crciController.AddToManager(mgr, gvk); err != nil {
@@ -191,7 +211,7 @@ func benchmarkCacheMemoryN(
 	}
 
 	objs := make([]client.Object, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		objs[i] = createObj(ns.Name, i)
 	}
 

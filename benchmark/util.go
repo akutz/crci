@@ -12,6 +12,7 @@ import (
 	kruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	openapispec "k8s.io/kube-openapi/pkg/validation/spec"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -176,12 +177,28 @@ func splitYAMLDocuments(data []byte) []string {
 type objectCreator func(namespace string, i int) client.Object
 
 // objectCreatorForWatched returns an objectCreator that creates fuzz objects
-// for the given watched resource.
-// gvk is used to understand registered types; crds (when non-nil) supply
-// OpenAPIV3Schema for CRDs so fuzzUnstructured can generate schema-aware fuzz.
+// for the given watched resource. rootSchema and components are from the API
+// server's OpenAPI v3; when nil, unstructured fuzz uses minimal spec.
 func objectCreatorForWatched(
-	crds []*apiextensionsv1.CustomResourceDefinition,
-	gvk schema.GroupVersionKind) (objectCreator, error) {
+	opts BenchmarkCacheMemoryOptions) (objectCreator, error) {
+
+	// Schema for fuzzing is discovered from the API server's OpenAPI v3, not
+	// from CRD files.
+	var (
+		rootSchema *openapispec.Schema
+		components map[string]*openapispec.Schema
+		gvk        = opts.GroupVersionKind
+	)
+	schemaResult, err := FetchSchemaForGVK(opts.Config, gvk)
+	if err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			" (openapi schema: %v, fuzzing with minimal spec) ",
+			err)
+	} else {
+		rootSchema = schemaResult.RootSchema
+		components = schemaResult.Components
+	}
 
 	var oc objectCreator
 
@@ -193,7 +210,7 @@ func objectCreatorForWatched(
 	case gvk.Group == "" && gvk.Version == "v1" && gvk.Kind == "Pod":
 		oc = func(ns string, i int) client.Object { return fuzzPod(ns, i) }
 	default:
-		oc = func(ns string, i int) client.Object { return fuzzUnstructured(crds, gvk, ns, i) }
+		oc = func(ns string, i int) client.Object { return fuzzUnstructured(rootSchema, components, gvk, ns, i) }
 	}
 
 	return func(ns string, i int) client.Object {
