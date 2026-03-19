@@ -15,10 +15,11 @@ import (
 )
 
 // SkipNameValidation may be set to true in tests/benchmarks to allow multiple
-// controllers with the same logical name (e.g. when starting multiple envtest runs).
+// controllers with the same logical name (e.g. when starting multiple runs).
 var SkipNameValidation *bool
 
-// AddToManager adds the watch controller to the manager for the given watched resource type.
+// AddToManager adds the watch controller to the manager for the given watched
+// resource type.
 func AddToManager(mgr manager.Manager, gvk schema.GroupVersionKind) error {
 	obj, err := objectForGVK(mgr.GetScheme(), gvk)
 	if err != nil {
@@ -40,14 +41,18 @@ func AddToManager(mgr manager.Manager, gvk schema.GroupVersionKind) error {
 		Complete(r)
 }
 
-// Reconciler reconciles the watched resource type (no-op; used to drive the cache).
+// Reconciler reconciles the watched resource type (no-op; used to drive the
+// cache).
 type Reconciler struct {
 	client.Client
 	Logger logr.Logger
 }
 
 // Reconcile is a no-op; the controller exists to populate and hold the cache.
-func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *Reconciler) Reconcile(
+	ctx context.Context,
+	req ctrl.Request) (ctrl.Result, error) {
+
 	_ = req
 	r.Logger.V(2).Info("reconcile", "request", req)
 	return ctrl.Result{}, nil

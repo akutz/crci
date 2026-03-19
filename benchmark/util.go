@@ -6,12 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	kruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
+	openapispec "k8s.io/kube-openapi/pkg/validation/spec"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -85,54 +83,6 @@ func parseGVK(s string) (schema.GroupVersionKind, error) {
 		"resource must be configmap, secret, pod, or group/version/kind (got %q)", s)
 }
 
-// loadCRDsFromPaths reads one or more CRD YAML files (each may contain multiple documents
-// separated by ---) and returns the CustomResourceDefinition objects for envtest.
-func loadCRDsFromPaths(paths []string) ([]*apiextensionsv1.CustomResourceDefinition, error) {
-	scheme := kruntime.NewScheme()
-	if err := apiextensionsv1.AddToScheme(scheme); err != nil {
-		return nil, fmt.Errorf("add apiextensions scheme: %w", err)
-	}
-	codec := serializer.NewCodecFactory(scheme).UniversalDeserializer()
-
-	var crds []*apiextensionsv1.CustomResourceDefinition
-	moduleRoot, err := findModuleRoot()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, path := range paths {
-		path = strings.TrimSpace(path)
-		if path == "" {
-			continue
-		}
-		// Resolve relative to module root so -crds=file.yaml works when run from repo root.
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(moduleRoot, path)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read CRD file %q: %w", path, err)
-		}
-		// Split by "---" for multi-document YAML.
-		docs := splitYAMLDocuments(data)
-		for _, doc := range docs {
-			if len(strings.TrimSpace(doc)) == 0 {
-				continue
-			}
-			obj, _, err := codec.Decode([]byte(doc), nil, nil)
-			if err != nil {
-				return nil, fmt.Errorf("decode CRD from %q: %w", path, err)
-			}
-			crd, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
-			if !ok {
-				return nil, fmt.Errorf("object in %q is not a CRD: %T", path, obj)
-			}
-			crds = append(crds, crd)
-		}
-	}
-	return crds, nil
-}
-
 // findModuleRoot returns the directory containing go.mod (module root), or an error.
 func findModuleRoot() (string, error) {
 	dir, err := os.Getwd()
@@ -151,49 +101,36 @@ func findModuleRoot() (string, error) {
 	}
 }
 
-func splitYAMLDocuments(data []byte) []string {
-	const sep = "\n---"
-	var out []string
-	rest := string(data)
-	for {
-		i := strings.Index(rest, sep)
-		if i < 0 {
-			if strings.TrimSpace(rest) != "" {
-				out = append(out, rest)
-			}
-			return out
-		}
-		doc := rest[:i]
-		if strings.TrimSpace(doc) != "" {
-			out = append(out, doc)
-		}
-		rest = rest[i+len(sep):]
-	}
-}
-
 // objectCreator creates a client.Object for the i-th fuzz resource in the given
 // namespace.
 type objectCreator func(namespace string, i int) client.Object
 
 // objectCreatorForWatched returns an objectCreator that creates fuzz objects
-// for the given watched resource.
-// gvk is used to understand registered types; crds (when non-nil) supply
-// OpenAPIV3Schema for CRDs so fuzzUnstructured can generate schema-aware fuzz.
+// for the given watched resource. rootSchema and components are from the API
+// server's OpenAPI v3; when nil, unstructured fuzz uses minimal spec.
 func objectCreatorForWatched(
-	crds []*apiextensionsv1.CustomResourceDefinition,
-	gvk schema.GroupVersionKind) (objectCreator, error) {
+	opts BenchmarkCacheMemoryOptions) (objectCreator, error) {
 
-	var oc objectCreator
+	// Schema for fuzzing is discovered from the API server's OpenAPI v3, not
+	// from CRD files.
+	var (
+		rootSchema *openapispec.Schema
+		components map[string]*openapispec.Schema
+		gvk        = opts.GroupVersionKind
+	)
+	schemaResult, err := FetchSchemaForGVK(opts.Config, gvk)
+	if err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			" (openapi schema: %v, fuzzing with minimal spec) ",
+			err)
+	} else {
+		rootSchema = schemaResult.RootSchema
+		components = schemaResult.Components
+	}
 
-	switch {
-	case gvk.Group == "" && gvk.Version == "v1" && gvk.Kind == "ConfigMap":
-		oc = func(ns string, i int) client.Object { return fuzzConfigMap(ns, i) }
-	case gvk.Group == "" && gvk.Version == "v1" && gvk.Kind == "Secret":
-		oc = func(ns string, i int) client.Object { return fuzzSecret(ns, i) }
-	case gvk.Group == "" && gvk.Version == "v1" && gvk.Kind == "Pod":
-		oc = func(ns string, i int) client.Object { return fuzzPod(ns, i) }
-	default:
-		oc = func(ns string, i int) client.Object { return fuzzUnstructured(crds, gvk, ns, i) }
+	oc := func(ns string, i int) client.Object {
+		return fuzzUnstructured(rootSchema, components, gvk, ns, i)
 	}
 
 	return func(ns string, i int) client.Object {

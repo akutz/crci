@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/go-logr/logr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -21,12 +20,14 @@ import (
 )
 
 var (
-	resourceFlag       string
-	crdsFlag           string
-	outputFormatFlag   string
-	fibonacciFlag      int
-	printFibonacciFlag bool
-	pauseFlag          bool
+	resourceFlag     string
+	crdFilePathsFlag string
+	crdDirPathsFlag  string
+	outputFormatFlag string
+	dryRunFlag       bool
+	fibonacciFlag    int
+	pauseFlag        bool
+	printYAMLFlag    bool
 )
 
 func main() {
@@ -40,15 +41,22 @@ func main() {
 	)
 
 	flag.StringVar(
-		&crdsFlag,
+		&crdFilePathsFlag,
 		"crds",
 		"",
-		"Comma-separated paths to CRD YAML files to load into envtest "+
-			"(e.g. crds/vm.yaml,crds/other.yaml)")
+		"Comma-separated paths to CRD YAML files to "+
+			"load (e.g. ./crds/vm.yaml,./crds/other.yaml)")
+
+	flag.StringVar(
+		&crdDirPathsFlag,
+		"crd-dirs",
+		"",
+		"Comma-separated paths to directories with CRD YAML files to "+
+			"load (e.g. ./,./crds/)")
 
 	flag.StringVar(
 		&outputFormatFlag,
-		"format",
+		"output-format",
 		"text",
 		"The output format: text, markdown, csv. Defaults to text.")
 
@@ -56,26 +64,32 @@ func main() {
 		&fibonacciFlag,
 		"fib",
 		14, // 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610
-		"The number of fibonacci numbers to use. Defaults to 14 (which is 610).")
+		"The number of fibonacci numbers to use."+
+			"Defaults to 14 (which is 610).")
 
 	flag.BoolVar(
-		&printFibonacciFlag,
-		"fib-print",
+		&dryRunFlag,
+		"dry-run",
 		false,
-		"Set to true to print the fibonacci sequence to the console.")
+		"Set to true to print the benchmark summary and exit.")
 
 	flag.BoolVar(
 		&pauseFlag,
 		"pause",
 		false,
-		"Set to true to pause the program after the API server is started.")
+		"Set to true to pause the program before running the benchmark. "+
+			"Useful for debugging envtest using kubectl.")
+
+	flag.BoolVar(
+		&printYAMLFlag,
+		"print-yaml",
+		false,
+		"Set to true to print the YAML of one of the generated objects.")
 
 	flag.Parse()
 
 	if fibonacciFlag < 2 {
-		fmt.Fprintf(os.Stderr, "Invalid argument: -fib must be >= 2\n")
-		flag.Usage()
-		os.Exit(1)
+		abortWithUsage("Invalid argument: -fib must be >= 2\n")
 	}
 
 	outputFormat := benchmark.OutputFormat(outputFormatFlag)
@@ -85,28 +99,24 @@ func main() {
 		benchmark.OutputFormatText:
 		// Allowed
 	default:
-		fmt.Fprintf(
-			os.Stderr,
+		abortWithUsage(
 			"Invalid argument: -format must be one of: %s, %s, %s\n",
 			benchmark.OutputFormatCSV,
 			benchmark.OutputFormatMarkdown,
 			benchmark.OutputFormatText)
-		flag.Usage()
-		os.Exit(1)
 	}
 
 	ctrl.SetLogger(logr.Discard())
 
 	opts := benchmark.BenchmarkCacheMemoryOptions{
-		OutputFormat:   outputFormat,
-		Fibonacci:      fibonacciFlag,
-		FibonacciPrint: printFibonacciFlag,
-		Pause:          pauseFlag,
+		DryRun:       dryRunFlag,
+		OutputFormat: outputFormat,
+		Fibonacci:    fibonacciFlag,
+		Pause:        pauseFlag,
+		PrintYAML:    printYAMLFlag,
 	}
 
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		10*time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var (
@@ -117,6 +127,8 @@ func main() {
 
 	cleanup = func() {
 		cleanupOnce.Do(func() {
+			cancel()
+			fmt.Fprintln(os.Stderr)
 			for _, fn := range cleanupFns {
 				if err := fn(); err != nil {
 					fmt.Fprintf(os.Stderr, "cleanup failed: %v\n", err)
@@ -144,16 +156,15 @@ func main() {
 		syscall.SIGTERM)
 	go func() {
 		<-sigs
-		cancel()
 		cleanup()
 	}()
 
 	var (
-		env                  envtest.Environment
-		externalControlPlane bool
-		kubeconfig           string
+		env        envtest.Environment
+		kubeconfig string
 	)
 
+	// Determine whether to use an existing cluster or start a new one.
 	if f := flag.Lookup("kubeconfig"); f != nil && f.Value.String() != "" {
 		kubeconfig = f.Value.String()
 	} else {
@@ -162,55 +173,86 @@ func main() {
 	if kubeconfig == "" {
 		kubeconfig = ".kubeconfig"
 	}
-
-	opts.KubeConfig = kubeconfig
-
-	if _, err := os.Stat(opts.KubeConfig); err != nil {
+	if _, err := os.Stat(kubeconfig); err != nil {
 		if !os.IsNotExist(err) {
 			abort("failed to stat kubeconfig file: %v\n", err)
 		}
+		env.UseExistingCluster = &[]bool{false}[0]
 	} else {
 		env.UseExistingCluster = &[]bool{true}[0]
-		externalControlPlane = true
 	}
+	opts.KubeConfig = kubeconfig
 
-	if !externalControlPlane && crdsFlag != "" {
-		var crds []string
-		for _, p := range strings.Split(crdsFlag, ",") {
-			if s := strings.TrimSpace(p); s != "" {
-				crds = append(crds, s)
+	// If not using an existing cluster, configure the envtest.
+	if env.UseExistingCluster != nil && !*env.UseExistingCluster {
+
+		// Customize the API server's arguments.
+		apiServer := env.ControlPlane.GetAPIServer()
+		args := apiServer.Configure()
+		args.Set(
+			"disable-admission-plugins",
+			strings.Join(defaultAdmissionPlugins, ","))
+
+		// Install the CRDs.
+		if v := crdFilePathsFlag; v != "" {
+			var paths []string
+			for _, p := range strings.Split(v, ",") {
+				if s := strings.TrimSpace(p); s != "" {
+					paths = append(paths, s)
+				}
 			}
+			env.CRDInstallOptions.Paths = paths
+			env.CRDInstallOptions.ErrorIfPathMissing = true
 		}
-		env.CRDInstallOptions.Paths = crds
-		env.CRDInstallOptions.ErrorIfPathMissing = true
+		if v := crdDirPathsFlag; v != "" {
+			var paths []string
+			for _, p := range strings.Split(v, ",") {
+				if s := strings.TrimSpace(p); s != "" {
+					paths = append(paths, s)
+				}
+			}
+			env.CRDDirectoryPaths = paths
+			env.CRDInstallOptions.ErrorIfPathMissing = true
+		}
 	}
 
+	// Start the envtest.
 	cfg, err := env.Start()
 	if err != nil {
-		abort("envtest start failed: %v\n", err)
+		abort("failed to start envtest: %v\n", err)
 	}
 	cleanupFns = append(cleanupFns, func() error {
+		fmt.Fprintln(os.Stderr, "* Stopping envtest")
 		if err := env.Stop(); err != nil {
-			return fmt.Errorf("envtest stop failed: %w", err)
+			return fmt.Errorf("failed to stop envtest: %w", err)
 		}
 		return nil
 	})
 	opts.Config = cfg
 
-	if !externalControlPlane {
+	// If not using an existing cluster, emit the envtest kubeconfig to the
+	// file specified by the -kubeconfig flag.
+	if env.UseExistingCluster != nil && !*env.UseExistingCluster {
+		// Ensure the kubeconfig file is deleted when the benchmark is
+		// complete or the program is interrupted if kubeconfig does not
+		// point to an existing cluster.
+		cleanupFns = append(cleanupFns, func() error {
+			fmt.Fprintf(os.Stderr, "* Removing %q\n", opts.KubeConfig)
+			_ = os.RemoveAll(opts.KubeConfig)
+			return nil
+		})
+
+		// Create the kubeconfig file.
 		f, err := os.Create(opts.KubeConfig)
 		if err != nil {
 			abort("failed to create temp kubeconfig file: %v\n", err)
 		}
-		cleanupFns = append(cleanupFns, func() error {
-			_ = os.RemoveAll(f.Name())
-			return nil
-		})
 		if _, err := io.Copy(f, bytes.NewReader(env.KubeConfig)); err != nil {
 			abort("failed to write kubeconfig to temp file: %v\n", err)
 		}
 	}
 
+	// Get the GroupVersionKind for the resource to test.
 	gvk, err := benchmark.ResolveGroupVersionKind(
 		strings.TrimSpace(resourceFlag))
 	if err != nil {
@@ -218,7 +260,41 @@ func main() {
 	}
 	opts.GroupVersionKind = gvk
 
+	// Run the benchmark.
 	if err := benchmark.BenchmarkCacheMemory(ctx, opts); err != nil {
 		abort("benchmark failed: %v\n", err)
 	}
+}
+
+func abortWithUsage(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, format, a...)
+	flag.Usage()
+	os.Exit(1)
+}
+
+// From https://kubernetes.io/docs/reference/command-line-tools-reference/kube-apiserver/
+var defaultAdmissionPlugins = []string{
+	"NamespaceLifecycle",
+	"LimitRanger",
+	"ServiceAccount",
+	"TaintNodesByCondition",
+	"PodSecurity",
+	"Priority",
+	"DefaultTolerationSeconds",
+	"DefaultStorageClass",
+	"StorageObjectInUseProtection",
+	"PersistentVolumeClaimResize",
+	"RuntimeClass",
+	"CertificateApproval",
+	"CertificateSigning",
+	"ClusterTrustBundleAttest",
+	"CertificateSubjectRestriction",
+	"DefaultIngressClass",
+	"PodTopologyLabels",
+	"NodeDeclaredFeatureValidator",
+	"MutatingAdmissionPolicy",
+	"MutatingAdmissionWebhook",
+	"ValidatingAdmissionPolicy",
+	"ValidatingAdmissionWebhook",
+	"ResourceQuota",
 }
