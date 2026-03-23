@@ -1,4 +1,4 @@
-package benchmark
+package openapi
 
 import (
 	"encoding/base64"
@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -13,8 +14,264 @@ import (
 	"github.com/google/uuid"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
+	openapi3 "k8s.io/client-go/openapi3"
+	"k8s.io/client-go/rest"
+	"k8s.io/kube-openapi/pkg/spec3"
 	openapispec "k8s.io/kube-openapi/pkg/validation/spec"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/akutz/crci/benchmark/fuzzer"
 )
+
+// New returns a new fuzzer that fuzzes the given GVK using the API server's
+// OpenAPI v3 schema.
+func New(
+	config *rest.Config,
+	gvk schema.GroupVersionKind) fuzzer.FuzzerFn {
+
+	// Schema for fuzzing is discovered from the API server's OpenAPI v3, not
+	// from CRD files.
+	var (
+		rootSchema *openapispec.Schema
+		components map[string]*openapispec.Schema
+	)
+	schemaResult, err := fetchSchemaForGVK(config, gvk)
+	if err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			" (openapi schema: %v, fuzzing with minimal spec) ",
+			err)
+	} else {
+		rootSchema = schemaResult.RootSchema
+		components = schemaResult.Components
+	}
+
+	return func(obj client.Object, namespace string, i int) error {
+		switch tObj := obj.(type) {
+		case *unstructured.Unstructured:
+			fuzzUnstructured(gvk, rootSchema, components, tObj, namespace, i)
+		default:
+			return fmt.Errorf("unsupported object type: %T", obj)
+		}
+		return nil
+	}
+}
+
+// fuzzUnstructured returns an Unstructured for the given GVK, using
+// the OpenAPI root schema and components when available to guide fuzz.
+func fuzzUnstructured(
+	gvk schema.GroupVersionKind,
+	rootSchema *openapispec.Schema,
+	components map[string]*openapispec.Schema,
+	obj *unstructured.Unstructured,
+	namespace string,
+	seed int) {
+
+	r := rand.New(rand.NewSource(int64(seed)))
+	obj.SetNamespace(namespace)
+	obj.SetName(fmt.Sprintf("%s-%d-%d", strings.ToLower(gvk.Kind), seed, r.Int()))
+	obj.SetLabels(map[string]string{"bench": "crci", "seed": fmt.Sprintf("%d", seed)})
+
+	if rootSchema != nil && components != nil {
+		if specSchema, ok := rootSchema.Properties["spec"]; ok {
+			spec := specSchema
+			if specVal := fuzzFromOpenAPISchema(&spec, components, nil, seed, 0, gvk, "spec"); specVal != nil {
+				if m, ok := specVal.(map[string]interface{}); ok {
+					_ = unstructured.SetNestedField(obj.Object, m, "spec")
+				}
+			}
+		}
+		if statusSchema, ok := rootSchema.Properties["status"]; ok {
+			status := statusSchema
+			if statusVal := fuzzFromOpenAPISchema(&status, components, nil, seed+1000, 0, gvk, "status"); statusVal != nil {
+				if m, ok := statusVal.(map[string]interface{}); ok {
+					sanitizeFuzzedStatus(m, &status, components)
+					_ = unstructured.SetNestedField(obj.Object, m, "status")
+				}
+			}
+		}
+	}
+}
+
+// schemaResult holds the root schema for a GVK and the components map
+// for resolving $ref when fuzzing.
+type schemaResult struct {
+	RootSchema *openapispec.Schema
+	Components map[string]*openapispec.Schema
+}
+
+// fetchSchemaForGVK fetches the OpenAPI v3 schema for the given GVK from the
+// API server. The CRD is still used to register the API (via envtest), but
+// schema discovery for fuzzing comes from the server's published OpenAPI.
+// See https://kubernetes.io/docs/concepts/overview/kubernetes-api/
+func fetchSchemaForGVK(
+	cfg *rest.Config,
+	gvk schema.GroupVersionKind) (*schemaResult, error) {
+
+	disc, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("discovery client: %w", err)
+	}
+
+	openapiClient := disc.OpenAPIV3()
+	if openapiClient == nil {
+		return nil, fmt.Errorf("OpenAPI v3 not supported")
+	}
+
+	root := openapi3.NewRoot(openapiClient)
+
+	var (
+		spec    *spec3.OpenAPI
+		specErr error
+		gv      = gvk.GroupVersion()
+	)
+
+	for i := range 5 {
+		spec, specErr = root.GVSpec(gv)
+		if specErr == nil && spec != nil {
+			break
+		}
+		if i < 4 {
+			time.Sleep(1 * time.Second)
+		} else {
+			return nil, fmt.Errorf(
+				"fetch OpenAPI v3 for %s: %w", gv.String(), specErr)
+		}
+	}
+
+	if spec == nil || spec.Components == nil || spec.Components.Schemas == nil {
+		return nil, fmt.Errorf("no schemas in OpenAPI v3 for %s", gv.String())
+	}
+	rootSchema := findSchemaForGVK(spec.Components.Schemas, gvk)
+	if rootSchema == nil {
+		return nil, fmt.Errorf("no schema found for %s in OpenAPI v3", gvk.String())
+	}
+	// Resolve root schema $ref chain until we have concrete Properties (e.g. spec, status).
+	// Built-in and CRD types often have a top-level schema that is only a $ref or allOf.
+	visited := make(map[string]bool)
+	for rootSchema.Ref.String() != "" {
+		resolved := resolveRef(rootSchema, spec.Components.Schemas, visited)
+		if resolved == nil {
+			break
+		}
+		rootSchema = resolved
+		if len(rootSchema.Properties) > 0 {
+			break
+		}
+	}
+	// Kubernetes OpenAPI v3 often uses allOf; take the first sub-schema that has Properties.
+	if len(rootSchema.Properties) == 0 && len(rootSchema.AllOf) > 0 {
+		for i := range rootSchema.AllOf {
+			sub := &rootSchema.AllOf[i]
+			resolved := sub
+			if sub.Ref.String() != "" {
+				resolved = resolveRef(sub, spec.Components.Schemas, nil)
+				if resolved == nil {
+					continue
+				}
+			}
+			if len(resolved.Properties) > 0 {
+				rootSchema = resolved
+				break
+			}
+		}
+	}
+	return &schemaResult{
+		RootSchema: rootSchema,
+		Components: spec.Components.Schemas,
+	}, nil
+}
+
+// findSchemaForGVK finds the schema in schemas that has
+// x-kubernetes-group-version-kind matching gvk.
+func findSchemaForGVK(
+	schemas map[string]*openapispec.Schema,
+	gvk schema.GroupVersionKind) *openapispec.Schema {
+
+	for _, s := range schemas {
+		if s == nil {
+			continue
+		}
+		if gvkMatches(s.Extensions, gvk) {
+			return s
+		}
+	}
+	return nil
+}
+
+func gvkMatches(ext map[string]interface{}, gvk schema.GroupVersionKind) bool {
+	raw, ok := ext["x-kubernetes-group-version-kind"]
+	if !ok {
+		return false
+	}
+	slice, ok := raw.([]interface{})
+	if !ok || len(slice) == 0 {
+		return false
+	}
+	for _, item := range slice {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		g, _ := m["group"].(string)
+		v, _ := m["version"].(string)
+		k, _ := m["kind"].(string)
+		if g == gvk.Group && v == gvk.Version && k == gvk.Kind {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveRef returns the schema pointed to by s.Ref from components, or nil.
+// visited is used to avoid infinite recursion on cycles; pass nil to start.
+func resolveRef(
+	s *openapispec.Schema,
+	components map[string]*openapispec.Schema,
+	visited map[string]bool) *openapispec.Schema {
+
+	if s == nil || components == nil {
+		return nil
+	}
+	refStr := s.Ref.String()
+	if refStr == "" {
+		return s
+	}
+	name := refName(refStr)
+	if name == "" {
+		return nil
+	}
+	if visited != nil && visited[name] {
+		return nil
+	}
+	if visited == nil {
+		visited = make(map[string]bool)
+	}
+	visited[name] = true
+	refSchema := components[name]
+	if refSchema == nil {
+		return nil
+	}
+	// The ref might point to another ref
+	if refSchema.Ref.String() != "" {
+		return resolveRef(refSchema, components, visited)
+	}
+	return refSchema
+}
+
+func refName(ref string) string {
+	// ref is like "#/components/schemas/io.k8s.api.core.v1.Pod"
+	const prefix = "#/components/schemas/"
+	if strings.HasPrefix(ref, prefix) {
+		return ref[len(prefix):]
+	}
+	const defPrefix = "#/definitions/"
+	if strings.HasPrefix(ref, defPrefix) {
+		return ref[len(defPrefix):]
+	}
+	return ""
+}
 
 func openAPISchemaType(s *openapispec.Schema) string {
 	if s == nil || len(s.Type) == 0 {
@@ -52,7 +309,7 @@ func flattenSchemaProperties(s *openapispec.Schema, components map[string]*opena
 			return nil, nil
 		}
 		// Let ResolveRef set visited when it follows the ref; do not mark before or we block resolution.
-		resolved := ResolveRef(s, components, visited)
+		resolved := resolveRef(s, components, visited)
 		if resolved == nil && name != "" {
 			resolved = components[name]
 		}
@@ -92,7 +349,7 @@ func findPropertyInAllOf(s *openapispec.Schema, key string, components map[strin
 	}
 	// Resolve $ref so we look at the actual schema
 	if s.Ref.String() != "" && components != nil {
-		if resolved := ResolveRef(s, components, visited); resolved != nil {
+		if resolved := resolveRef(s, components, visited); resolved != nil {
 			s = resolved
 		}
 	}
@@ -113,7 +370,7 @@ func findPropertyInAllOf(s *openapispec.Schema, key string, components map[strin
 		sub := &s.AllOf[i]
 		resolved := sub
 		if sub.Ref.String() != "" && components != nil {
-			resolved = ResolveRef(sub, components, copyVisitedOpenAPI(visited))
+			resolved = resolveRef(sub, components, copyVisitedOpenAPI(visited))
 			if resolved == nil {
 				// Cycle: shallow look in the ref'd schema (no recurse to avoid infinite loop).
 				if name := refName(sub.Ref.String()); name != "" {
@@ -167,7 +424,7 @@ func openAPISchemaTypeWithRefAllOf(s *openapispec.Schema, components map[string]
 	}
 	resolved := s
 	if s.Ref.String() != "" && components != nil {
-		resolved = ResolveRef(s, components, visited)
+		resolved = resolveRef(s, components, visited)
 		if resolved == nil {
 			return ""
 		}
@@ -182,7 +439,7 @@ func openAPISchemaTypeWithRefAllOf(s *openapispec.Schema, components map[string]
 		sub := &resolved.AllOf[i]
 		r := sub
 		if sub.Ref.String() != "" && components != nil {
-			r = ResolveRef(sub, components, copyVisitedOpenAPI(visited))
+			r = resolveRef(sub, components, copyVisitedOpenAPI(visited))
 			if r == nil {
 				// Cycle: get type from the ref'd schema in components (shallow: no recurse to avoid infinite loop).
 				if name := refName(sub.Ref.String()); name != "" {
@@ -197,7 +454,7 @@ func openAPISchemaTypeWithRefAllOf(s *openapispec.Schema, components map[string]
 							subR := &refSchema.AllOf[j]
 							var resolved *openapispec.Schema
 							if subR.Ref.String() != "" {
-								resolved = ResolveRef(subR, components, copyVisitedOpenAPI(visited))
+								resolved = resolveRef(subR, components, copyVisitedOpenAPI(visited))
 								if resolved == nil {
 									if n := refName(refSchema.AllOf[j].Ref.String()); n != "" && components[n] != nil {
 										resolved = components[n]
@@ -273,7 +530,7 @@ func uniqueListMapKeyValue(itemSchema *openapispec.Schema, listKey string, i, se
 	}
 	item := itemSchema
 	if itemSchema.Ref.String() != "" && components != nil {
-		if resolved := ResolveRef(itemSchema, components, copyVisitedOpenAPI(visited)); resolved != nil {
+		if resolved := resolveRef(itemSchema, components, copyVisitedOpenAPI(visited)); resolved != nil {
 			item = resolved
 		}
 	}
@@ -283,7 +540,7 @@ func uniqueListMapKeyValue(itemSchema *openapispec.Schema, listKey string, i, se
 			sub := &item.AllOf[ai]
 			rsub := sub
 			if sub.Ref.String() != "" {
-				rsub = ResolveRef(sub, components, copyVisitedOpenAPI(visited))
+				rsub = resolveRef(sub, components, copyVisitedOpenAPI(visited))
 				if rsub == nil {
 					continue
 				}
@@ -342,7 +599,7 @@ func sanitizeFuzzedStatus(m map[string]interface{}, schema *openapispec.Schema, 
 	for k, v := range m {
 		propSchema := schema.Properties[k]
 		if propSchema.Ref.String() != "" && components != nil {
-			if resolved := ResolveRef(&propSchema, components, nil); resolved != nil {
+			if resolved := resolveRef(&propSchema, components, nil); resolved != nil {
 				propSchema = *resolved
 			}
 		}
@@ -751,7 +1008,7 @@ func fuzzFromOpenAPISchema(s *openapispec.Schema, components map[string]*openapi
 	}
 	// Resolve $ref so we fuzz the actual schema
 	if s.Ref.String() != "" {
-		resolved := ResolveRef(s, components, visited)
+		resolved := resolveRef(s, components, visited)
 		if resolved != nil {
 			s = resolved
 		}
@@ -1137,45 +1394,6 @@ func copyVisitedOpenAPI(m map[string]bool) map[string]bool {
 		c[k] = v
 	}
 	return c
-}
-
-// fuzzUnstructured returns an Unstructured for the given GVK, using the
-// OpenAPI root schema and components when available to guide fuzz.
-func fuzzUnstructured(
-	rootSchema *openapispec.Schema,
-	components map[string]*openapispec.Schema,
-	gvk schema.GroupVersionKind,
-	namespace string,
-	seed int) *unstructured.Unstructured {
-
-	r := rand.New(rand.NewSource(int64(seed)))
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(gvk)
-	u.SetNamespace(namespace)
-	u.SetName(fmt.Sprintf("%s-%d-%d", strings.ToLower(gvk.Kind), seed, r.Int()))
-	u.SetLabels(map[string]string{"bench": "crci", "seed": fmt.Sprintf("%d", seed)})
-
-	if rootSchema != nil && components != nil {
-		if specSchema, ok := rootSchema.Properties["spec"]; ok {
-			spec := specSchema
-			if specVal := fuzzFromOpenAPISchema(&spec, components, nil, seed, 0, gvk, "spec"); specVal != nil {
-				if m, ok := specVal.(map[string]interface{}); ok {
-					_ = unstructured.SetNestedField(u.Object, m, "spec")
-				}
-			}
-		}
-		if statusSchema, ok := rootSchema.Properties["status"]; ok {
-			status := statusSchema
-			if statusVal := fuzzFromOpenAPISchema(&status, components, nil, seed+1000, 0, gvk, "status"); statusVal != nil {
-				if m, ok := statusVal.(map[string]interface{}); ok {
-					sanitizeFuzzedStatus(m, &status, components)
-					_ = unstructured.SetNestedField(u.Object, m, "status")
-				}
-			}
-		}
-	}
-
-	return u
 }
 
 // pathJoin returns parentPath.childName, or childName if parentPath is empty.

@@ -21,6 +21,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/yaml"
 
+	"github.com/akutz/crci/benchmark/fuzzer"
+	fuzzerOpenAPI "github.com/akutz/crci/benchmark/fuzzer/openapi"
 	crciController "github.com/akutz/crci/controller"
 )
 
@@ -96,13 +98,12 @@ func BenchmarkCacheMemory(
 		"  * groupVersionKind: %s\n",
 		gvkStr)
 
-	createObj, err := objectCreatorForWatched(opts)
-	if err != nil {
-		return fmt.Errorf("failed to get object creator: %w", err)
-	}
+	createObj := getObjectCreator(opts.GroupVersionKind)
+	fuzzObj := fuzzerOpenAPI.New(opts.Config, opts.GroupVersionKind)
 
 	if opts.PrintYAML {
-		obj := createObj("", 0)
+		obj := createObj()
+		fuzzObj(obj, "", 0)
 		data, _ := yaml.Marshal(obj)
 		fmt.Fprintf(os.Stderr, "  * example object:\n")
 		fmt.Fprintf(os.Stderr, "    ---\n")
@@ -129,7 +130,12 @@ func BenchmarkCacheMemory(
 	var runs []heapRun
 	for _, n := range fib {
 		fmt.Fprintf(os.Stderr, "* %d objects...", n)
-		r, err := benchmarkCacheMemoryN(ctx, opts, createObj, n)
+		r, err := benchmarkCacheMemoryN(
+			ctx,
+			opts,
+			createObj,
+			fuzzObj,
+			n)
 		if err != nil {
 			return fmt.Errorf("n=%d: %w", n, err)
 		}
@@ -157,6 +163,7 @@ func benchmarkCacheMemoryN(
 	ctx context.Context,
 	opts BenchmarkCacheMemoryOptions,
 	createObj objectCreator,
+	fuzzObj fuzzer.FuzzerFn,
 	n int) (_ benchmarkCacheMemoryResult, retErr error) {
 
 	mgr, err := manager.New(opts.Config, manager.Options{})
@@ -208,7 +215,8 @@ func benchmarkCacheMemoryN(
 
 	objs := make([]client.Object, n)
 	for i := range n {
-		objs[i] = createObj(ns.Name, i)
+		objs[i] = createObj()
+		fuzzObj(objs[i], ns.Name, i)
 	}
 
 	var bytesYAML float64

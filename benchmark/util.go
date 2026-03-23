@@ -9,7 +9,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	openapispec "k8s.io/kube-openapi/pkg/validation/spec"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -101,41 +100,35 @@ func findModuleRoot() (string, error) {
 	}
 }
 
-// objectCreator creates a client.Object for the i-th fuzz resource in the given
-// namespace.
-type objectCreator func(namespace string, i int) client.Object
+// objectCreator is a function that creates a client.Object.
+type objectCreator func() client.Object
 
-// objectCreatorForWatched returns an objectCreator that creates fuzz objects
-// for the given watched resource. rootSchema and components are from the API
-// server's OpenAPI v3; when nil, unstructured fuzz uses minimal spec.
-func objectCreatorForWatched(
-	opts BenchmarkCacheMemoryOptions) (objectCreator, error) {
+// getObjectCreator returns a function that creates a client.Object.
+func getObjectCreator(
+	gvk schema.GroupVersionKind) objectCreator {
 
-	// Schema for fuzzing is discovered from the API server's OpenAPI v3, not
-	// from CRD files.
-	var (
-		rootSchema *openapispec.Schema
-		components map[string]*openapispec.Schema
-		gvk        = opts.GroupVersionKind
-	)
-	schemaResult, err := FetchSchemaForGVK(opts.Config, gvk)
-	if err != nil {
-		fmt.Fprintf(
-			os.Stderr,
-			" (openapi schema: %v, fuzzing with minimal spec) ",
-			err)
-	} else {
-		rootSchema = schemaResult.RootSchema
-		components = schemaResult.Components
+	switch gvk {
+
+	// TODO(akutz): Add support for explicit types.
+
+	// case schema.GroupVersionKind{
+	// 	Group:   "",
+	// 	Version: "v1",
+	// 	Kind:    "ConfigMap",
+	// }:
+	// 	return func() client.Object {
+	// 		return &corev1.ConfigMap{}
+	// 	}
+
+	default:
+		return func() client.Object {
+			u := unstructured.Unstructured{
+				Object: map[string]any{},
+			}
+			u.SetGroupVersionKind(gvk)
+			return &u
+		}
 	}
-
-	oc := func(ns string, i int) client.Object {
-		return fuzzUnstructured(rootSchema, components, gvk, ns, i)
-	}
-
-	return func(ns string, i int) client.Object {
-		return toUnstructured(oc(ns, i), gvk)
-	}, nil
 }
 
 func toUnstructured(
